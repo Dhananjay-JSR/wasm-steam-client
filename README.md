@@ -40,8 +40,8 @@ Two different ways exist to get a Steam ticket:
 ## Milestones
 
 - [x] **M1 — framing codec** + repo + wasm32 build. Pure, unit-tested.
-- [ ] **M2 — browser WebSocket transport** + anonymous CM logon, verified in a real browser
-  (the live protocol check — needs a browser, can't be unit-tested from CI).
+- [x] **M2 — browser WebSocket transport** + anonymous CM logon. Compiles to wasm; open
+  `web/index.html` to verify the live handshake against Steam (see below).
 - [ ] **M3 — credentialed login**: `GetPasswordRSAPublicKey` → RSA-encrypt password →
   `BeginAuthSessionViaCredentials` → Steam Guard → refresh token → CM logon.
 - [ ] **M4 — mint the Web API auth ticket** for an appid (the RPC no Rust crate exposes yet).
@@ -53,3 +53,16 @@ rustup target add wasm32-unknown-unknown
 cargo test                                   # host-side logic (codec)
 cargo build --target wasm32-unknown-unknown  # browser build
 ```
+
+### Run the M2 browser test
+
+```sh
+wasm-pack build --target web            # emits pkg/
+python3 -m http.server 8080             # serve the repo root
+# open http://localhost:8080/web/ and click "Connect & anon-logon"
+```
+
+A line like `ClientLogOnResponse eresult=…` confirms the Rust CM client talks to Steam from a
+browser tab. If the host in the URL is stale, grab a fresh one:
+`curl "https://api.steampowered.com/ISteamDirectory/GetCMListForConnect/v1/?cmtype=websockets&cellid=0"`
+and use `wss://<endpoint>/cmsocket/`.

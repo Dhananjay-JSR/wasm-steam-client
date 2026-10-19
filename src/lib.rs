@@ -13,3 +13,6 @@
 //! (no I/O), so it unit-tests on the host and compiles unchanged to wasm32.
 
 pub mod codec;
+
+#[cfg(target_arch = "wasm32")]
+pub mod transport;

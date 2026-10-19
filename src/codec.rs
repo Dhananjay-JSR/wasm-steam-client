@@ -71,11 +71,14 @@ pub fn decode(data: &[u8]) -> Result<Frame, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protobuf::Enum;
     use steam_vent_proto_steam::enums_clientserver::EMsg;
 
     #[test]
     fn roundtrip_preserves_emsg_header_and_body() {
-        let emsg = EMsg::k_EMsgClientLogon as u32; // 5514
+        // .value() is the real wire number (5514); `as u32` would be the Rust discriminant.
+        let emsg = EMsg::k_EMsgClientLogon.value() as u32;
+        assert_eq!(emsg, 5514);
         let mut header = CMsgProtoBufHeader::new();
         header.set_steamid(76561198000000001);
         header.set_client_sessionid(42);

@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>wasm-steam-client — M2 transport test</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 820px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 18px; }
+  input { width: 100%; padding: 6px; font-family: monospace; }
+  button { padding: 8px 14px; margin-top: 8px; cursor: pointer; }
+  #log { background: #111; color: #0f0; font-family: monospace; white-space: pre-wrap;
+         padding: 12px; margin-top: 16px; border-radius: 6px; min-height: 160px; }
+  .note { color: #666; }
+</style>
+</head>
+<body>
+<h1>wasm-steam-client — Milestone 2: anonymous CM logon</h1>
+<p class="note">
+  Proves the Rust CM client runs in a browser tab: it opens a <code>wss://</code> socket to a Steam
+  Connection Manager, sends an <b>anonymous</b> ClientLogon (no credentials), and prints whatever
+  Steam frames back. An <code>eresult</code> — even a non-OK one — means transport + framing work.
+</p>
+<label>CM WebSocket URL (swap the host for a current one from GetCMListForConnect):</label>
+<input id="url" value="wss://ext1-maa2.steamserver.net:27031/cmsocket/" />
+<button id="go">Connect &amp; anon-logon</button>
+<div id="log">loading wasm…</div>
+
+<script type="module">
+  import init, { anon_logon } from "../pkg/wasm_steam_client.js";
+
+  const logEl = document.getElementById("log");
+  const line = (m) => { logEl.textContent += "\n" + m; };
+
+  await init();
+  logEl.textContent = "wasm ready.";
+
+  document.getElementById("go").onclick = () => {
+    const url = document.getElementById("url").value.trim();
+    logEl.textContent = "starting…";
+    try { anon_logon(url, line); }
+    catch (e) { line("error: " + e); }
+  };
+</script>
+</body>
+</html>
