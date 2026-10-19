@@ -5,9 +5,21 @@
 //! sent in `BeginAuthSessionViaCredentials`. The plaintext password never leaves
 //! the browser.
 
-use base64::prelude::{Engine, BASE64_STANDARD};
+use base64::prelude::{Engine, BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use rand::rngs::OsRng;
 use rsa::{BigUint, Pkcs1v15Encrypt, RsaPublicKey};
+
+/// Pull the SteamID64 out of a refresh/access token JWT (the `sub` claim). Steam's
+/// tokens are unsigned-readable JWTs; the authenticated logon needs this in the header.
+pub fn steamid_from_jwt(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let json = String::from_utf8(BASE64_URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
+    // find "sub":"<digits>"
+    let after_key = &json[json.find("\"sub\"")? + 5..];
+    let start = after_key.find('"')? + 1;
+    let end = after_key[start..].find('"')? + start;
+    after_key[start..end].parse().ok()
+}
 
 /// Encrypt `password` with the RSA public key given as hex `modulus`/`exponent`
 /// (the strings Steam returns), returning the base64 ciphertext Steam expects.
@@ -45,5 +57,14 @@ mod tests {
     #[test]
     fn rejects_bad_hex() {
         assert!(encrypt_password("zz", "010001", "x").is_err());
+    }
+
+    #[test]
+    fn steamid_from_jwt_reads_sub() {
+        // header.payload.sig where payload = {"iss":"steam","sub":"76561198000000001"}
+        let payload = BASE64_URL_SAFE_NO_PAD.encode(br#"{"iss":"steam","sub":"76561198000000001"}"#);
+        let jwt = format!("eyJ0eXAiOiJKV1QifQ.{payload}.sig");
+        assert_eq!(steamid_from_jwt(&jwt), Some(76561198000000001));
+        assert_eq!(steamid_from_jwt("not-a-jwt"), None);
     }
 }

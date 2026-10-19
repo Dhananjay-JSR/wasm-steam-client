@@ -14,9 +14,14 @@ use js_sys::Function;
 use protobuf::{Enum, Message};
 use steam_vent_proto_steam::enums_clientserver::EMsg;
 use steam_vent_proto_steam::steammessages_base::CMsgProtoBufHeader;
-use crate::auth::encrypt_password;
+use crate::auth::{encrypt_password, steamid_from_jwt};
 use protobuf::MessageField;
 use std::cell::RefCell;
+use steam_vent_proto_steam::steammessages_base::CMsgIPAddress;
+use steam_vent_proto_steam::steammessages_clientserver::{
+    CMsgClientGameConnectTokens, CMsgClientGetAppOwnershipTicket,
+    CMsgClientGetAppOwnershipTicketResponse,
+};
 use steam_vent_proto_steam::enums::ESessionPersistence;
 use steam_vent_proto_steam::steammessages_auth_steamclient::{
     CAuthentication_BeginAuthSessionViaCredentials_Request,
@@ -139,6 +144,14 @@ struct QrSession {
 }
 thread_local! {
     static QR: RefCell<Option<QrSession>> = const { RefCell::new(None) };
+    /// The refresh token from a successful login, kept for M4 (ticket minting).
+    static REFRESH_TOKEN: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The refresh token from the last successful login (for debugging / M4 wiring).
+#[wasm_bindgen]
+pub fn has_token() -> bool {
+    REFRESH_TOKEN.with(|t| t.borrow().is_some())
 }
 
 /// Render a challenge URL as an inline SVG QR code.
@@ -222,10 +235,12 @@ pub fn begin_qr(url: &str, log_cb: Function, qr_cb: Function) -> Result<(), JsVa
                     let Ok(r) = CAuthentication_PollAuthSessionStatus_Response::parse_from_bytes(&f.body) else { continue };
                     if !r.refresh_token().is_empty() {
                         let t = r.refresh_token();
+                        REFRESH_TOKEN.with(|rt| *rt.borrow_mut() = Some(t.to_string()));
                         log(&cb, &format!(
                             "✅ approved — logged in as {}! refresh_token: {}… ({} chars)",
                             r.account_name(), &t[..t.len().min(24)], t.len()
                         ));
+                        log(&cb, "token stored — ready to mint a ticket (M4).");
                         QR.with(|q| *q.borrow_mut() = None);
                     } else {
                         if r.had_remote_interaction() {
@@ -273,6 +288,162 @@ pub fn poll_qr() {
                 2,
                 &req.write_to_bytes().unwrap_or_default(),
             );
+        }
+    });
+}
+
+/// An authenticated CM session (after token logon), holding the ingredients the
+/// Web API auth ticket is built from.
+struct Session {
+    ws: WebSocket,
+    steamid: u64,
+    session_id: i32,
+    public_ip: u32,
+    app_id: u32,
+    gc_tokens: Vec<Vec<u8>>,
+    ownership_ticket: Vec<u8>,
+}
+thread_local! {
+    static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
+}
+
+/// Send a regular (authenticated) client message, stamping steamid + session id.
+fn client_send(ws: &WebSocket, emsg: u32, steamid: u64, session_id: i32, body: &[u8]) {
+    let mut h = CMsgProtoBufHeader::new();
+    h.set_steamid(steamid);
+    h.set_client_sessionid(session_id);
+    if let Ok(frame) = codec::encode(emsg, &h, body) {
+        let _ = ws.send_with_u8_array(&frame);
+    }
+}
+
+/// M4 (part A) — log onto the CM with the stored refresh token (as *you*), then
+/// gather the two ingredients a Web API auth ticket needs for `app_id`: a GC token
+/// (pushed by Steam after logon) and the app ownership ticket. Building + activating
+/// the ticket is part B.
+#[wasm_bindgen]
+pub fn mint_ticket(url: &str, app_id: u32, log_cb: Function) -> Result<(), JsValue> {
+    let token = match REFRESH_TOKEN.with(|t| t.borrow().clone()) {
+        Some(t) => t,
+        None => {
+            log(&log_cb, "no token yet — log in with QR first.");
+            return Ok(());
+        }
+    };
+    let steamid = match steamid_from_jwt(&token) {
+        Some(s) => s,
+        None => {
+            log(&log_cb, "could not read SteamID from the token.");
+            return Ok(());
+        }
+    };
+
+    let ws = WebSocket::new(url)?;
+    ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+    log(&log_cb, &format!("connecting to {url} to mint a ticket for app {app_id} …"));
+    SESSION.with(|s| {
+        *s.borrow_mut() = Some(Session {
+            ws: ws.clone(),
+            steamid,
+            session_id: 0,
+            public_ip: 0,
+            app_id,
+            gc_tokens: Vec::new(),
+            ownership_ticket: Vec::new(),
+        })
+    });
+
+    let ws_open = ws.clone();
+    let cb = log_cb.clone();
+    let onopen = Closure::<dyn FnMut()>::new(move || {
+        send_hello(&ws_open);
+        let mut ip = CMsgIPAddress::new();
+        ip.set_v4(0);
+        let mut logon = CMsgClientLogon::new();
+        logon.set_protocol_version(PROTOCOL_VERSION);
+        logon.set_client_os_type(203);
+        logon.set_supports_rate_limit_response(false);
+        logon.obfuscated_private_ip = MessageField::some(ip);
+        logon.set_client_language(String::new());
+        logon.set_machine_name(String::new());
+        logon.set_steamguard_dont_remember_computer(false);
+        logon.set_chat_mode(2);
+        logon.set_access_token(token.clone());
+        logon.set_client_package_version(1771);
+        client_send(&ws_open, EMsg::k_EMsgClientLogon.value() as u32, steamid, 0,
+            &logon.write_to_bytes().unwrap_or_default());
+        log(&cb, "logging in with your refresh token …");
+    });
+    ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+    onopen.forget();
+
+    let cb = log_cb.clone();
+    let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+        let data = js_sys::Uint8Array::new(&e.data()).to_vec();
+        for f in codec::flatten(&data) {
+            let emsg = f.emsg;
+            if emsg == EMsg::k_EMsgClientLogOnResponse.value() as u32 {
+                let Ok(r) = CMsgClientLogonResponse::parse_from_bytes(&f.body) else { continue };
+                if r.eresult() != 1 {
+                    log(&cb, &format!("❌ logon eresult={} — token may be expired, log in again", r.eresult()));
+                    continue;
+                }
+                let session_id = f.header.client_sessionid();
+                let public_ip = r.public_ip.ip.as_ref().and_then(|ip| match ip {
+                    steam_vent_proto_steam::steammessages_base::cmsg_ipaddress::Ip::V4(b) => Some(*b),
+                    _ => None,
+                }).unwrap_or(0);
+                SESSION.with(|s| if let Some(s) = s.borrow_mut().as_mut() {
+                    s.session_id = session_id;
+                    s.public_ip = public_ip;
+                });
+                log(&cb, &format!("✅ logged in as you (steamid={steamid}, session={session_id}); requesting app ownership ticket …"));
+                let (ws, app_id) = SESSION.with(|s| {
+                    let b = s.borrow();
+                    let s = b.as_ref().unwrap();
+                    (s.ws.clone(), s.app_id)
+                });
+                let mut req = CMsgClientGetAppOwnershipTicket::new();
+                req.set_app_id(app_id);
+                client_send(&ws, EMsg::k_EMsgClientGetAppOwnershipTicket.value() as u32, steamid, session_id,
+                    &req.write_to_bytes().unwrap_or_default());
+            } else if emsg == EMsg::k_EMsgClientGameConnectTokens.value() as u32 {
+                let Ok(r) = CMsgClientGameConnectTokens::parse_from_bytes(&f.body) else { continue };
+                let n = r.tokens.len();
+                SESSION.with(|s| if let Some(s) = s.borrow_mut().as_mut() {
+                    s.gc_tokens.extend(r.tokens);
+                });
+                log(&cb, &format!("received {n} GC token(s)"));
+                report_ready(&cb);
+            } else if emsg == EMsg::k_EMsgClientGetAppOwnershipTicketResponse.value() as u32 {
+                let Ok(r) = CMsgClientGetAppOwnershipTicketResponse::parse_from_bytes(&f.body) else { continue };
+                if r.eresult() != 1 {
+                    log(&cb, &format!("❌ app ownership ticket eresult={} (do you own app {}?)", r.eresult(), r.app_id()));
+                    continue;
+                }
+                let len = r.ticket().len();
+                SESSION.with(|s| if let Some(s) = s.borrow_mut().as_mut() {
+                    s.ownership_ticket = r.ticket().to_vec();
+                });
+                log(&cb, &format!("received app ownership ticket ({len} bytes) for app {}", r.app_id()));
+                report_ready(&cb);
+            }
+        }
+    });
+    ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+    onmessage.forget();
+
+    attach_status(&ws, &log_cb);
+    Ok(())
+}
+
+/// Log when both ticket ingredients are in hand.
+fn report_ready(cb: &Function) {
+    SESSION.with(|s| {
+        if let Some(s) = s.borrow().as_ref() {
+            if !s.gc_tokens.is_empty() && !s.ownership_ticket.is_empty() {
+                log(cb, "🧩 have GC token + ownership ticket — ready to build the Web API ticket (M4 part B).");
+            }
         }
     });
 }
