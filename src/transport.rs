@@ -126,6 +126,9 @@ pub fn get_rsa_key(url: &str, account_name: &str, log_cb: Function) -> Result<()
         let mut header = CMsgProtoBufHeader::new();
         header.set_target_job_name("Authentication.GetPasswordRSAPublicKey#1".to_string());
         header.set_jobid_source(1);
+        // NonAuthed service calls require realm=1 and an explicit steamid=0, else the CM drops them.
+        header.set_realm(1);
+        header.set_steamid(0);
         let mut req = CAuthentication_GetPasswordRSAPublicKey_Request::new();
         req.set_account_name(account.clone());
         let body = req.write_to_bytes().unwrap_or_default();
