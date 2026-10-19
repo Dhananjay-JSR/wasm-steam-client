@@ -18,7 +18,7 @@ use steam_vent_proto_steam::steammessages_auth_steamclient::{
     CAuthentication_GetPasswordRSAPublicKey_Request, CAuthentication_GetPasswordRSAPublicKey_Response,
 };
 use steam_vent_proto_steam::steammessages_clientserver_login::{
-    CMsgClientLogon, CMsgClientLogonResponse,
+    CMsgClientHello, CMsgClientLogon, CMsgClientLogonResponse,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -31,6 +31,17 @@ const PROTOCOL_VERSION: u32 = 65580;
 
 fn log(cb: &Function, msg: &str) {
     let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(msg));
+}
+
+/// Send the ClientHello the CM expects first, so it learns our protocol version
+/// before we make bare (non-logon) service calls. Fire-and-forget (no reply).
+fn send_hello(ws: &WebSocket) {
+    let mut body = CMsgClientHello::new();
+    body.set_protocol_version(PROTOCOL_VERSION);
+    let bytes = body.write_to_bytes().unwrap_or_default();
+    if let Ok(frame) = codec::encode(EMsg::k_EMsgClientHello.value() as u32, &CMsgProtoBufHeader::new(), &bytes) {
+        let _ = ws.send_with_u8_array(&frame);
+    }
 }
 
 /// Report every leaf frame in a received WebSocket message (Multi expanded).
@@ -123,6 +134,7 @@ pub fn get_rsa_key(url: &str, account_name: &str, log_cb: Function) -> Result<()
     let ws_send = ws.clone();
     let cb = log_cb.clone();
     let onopen = Closure::<dyn FnMut()>::new(move || {
+        send_hello(&ws_send);
         let mut header = CMsgProtoBufHeader::new();
         header.set_target_job_name("Authentication.GetPasswordRSAPublicKey#1".to_string());
         header.set_jobid_source(1);
