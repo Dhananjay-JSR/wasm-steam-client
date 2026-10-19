@@ -29,10 +29,14 @@
 <input id="account" placeholder="your steam login name" />
 <p><button id="rsa">M3.1 · Fetch RSA public key</button></p>
 
+<label>Password (M3.2 — encrypted in-browser, never sent in clear):</label>
+<input id="password" type="password" placeholder="your steam password" />
+<p><button id="begin">M3.2 · Begin login (RSA-encrypt + auth session)</button></p>
+
 <div id="log">loading wasm…</div>
 
 <script type="module">
-  import init, { anon_logon, get_rsa_key } from "../pkg/wasm_steam_client.js";
+  import init, { anon_logon, get_rsa_key, begin_login } from "../pkg/wasm_steam_client.js";
 
   const logEl = document.getElementById("log");
   const line = (m) => { logEl.textContent += "\n" + m; };
@@ -51,6 +55,14 @@
     if (!account) { logEl.textContent = "enter your Steam account name first."; return; }
     logEl.textContent = "starting RSA key fetch…";
     try { get_rsa_key(url(), account, line); } catch (e) { line("error: " + e); }
+  };
+
+  document.getElementById("begin").onclick = () => {
+    const account = document.getElementById("account").value.trim();
+    const password = document.getElementById("password").value;
+    if (!account || !password) { logEl.textContent = "enter account name and password first."; return; }
+    logEl.textContent = "starting login…";
+    try { begin_login(url(), account, password, line); } catch (e) { line("error: " + e); }
   };
 </script>
 </body>

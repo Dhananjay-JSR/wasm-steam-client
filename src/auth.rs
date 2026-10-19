@@ -1,0 +1,49 @@
+//! Password encryption for the Steam auth flow.
+//!
+//! Steam returns a per-account RSA public key (`GetPasswordRSAPublicKey`); the
+//! password is PKCS#1 v1.5-encrypted against it and base64-encoded before it's
+//! sent in `BeginAuthSessionViaCredentials`. The plaintext password never leaves
+//! the browser.
+
+use base64::prelude::{Engine, BASE64_STANDARD};
+use rand::rngs::OsRng;
+use rsa::{BigUint, Pkcs1v15Encrypt, RsaPublicKey};
+
+/// Encrypt `password` with the RSA public key given as hex `modulus`/`exponent`
+/// (the strings Steam returns), returning the base64 ciphertext Steam expects.
+pub fn encrypt_password(modulus: &str, exponent: &str, password: &str) -> Result<String, String> {
+    let n = BigUint::from_bytes_be(&hex::decode(modulus).map_err(|e| e.to_string())?);
+    let e = BigUint::from_bytes_be(&hex::decode(exponent).map_err(|e| e.to_string())?);
+    let key = RsaPublicKey::new(n, e).map_err(|e| e.to_string())?;
+    let ct = key
+        .encrypt(&mut OsRng, Pkcs1v15Encrypt, password.as_bytes())
+        .map_err(|e| e.to_string())?;
+    Ok(BASE64_STANDARD.encode(ct))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsa::traits::PublicKeyParts;
+    use rsa::RsaPrivateKey;
+
+    #[test]
+    fn encrypt_password_roundtrips_against_its_key() {
+        // generate a throwaway key, feed its public half as hex, encrypt, then decrypt
+        let mut rng = rand::thread_rng();
+        let priv_key = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+        let pub_key = priv_key.to_public_key();
+        let n_hex = hex::encode(pub_key.n().to_bytes_be());
+        let e_hex = hex::encode(pub_key.e().to_bytes_be());
+
+        let b64 = encrypt_password(&n_hex, &e_hex, "hunter2").unwrap();
+        let ct = BASE64_STANDARD.decode(b64).unwrap();
+        let pt = priv_key.decrypt(Pkcs1v15Encrypt, &ct).unwrap();
+        assert_eq!(pt, b"hunter2");
+    }
+
+    #[test]
+    fn rejects_bad_hex() {
+        assert!(encrypt_password("zz", "010001", "x").is_err());
+    }
+}

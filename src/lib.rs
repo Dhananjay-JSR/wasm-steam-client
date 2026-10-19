@@ -12,6 +12,7 @@
 //! This module is `codec`: the wire framing every CM message uses. It is pure
 //! (no I/O), so it unit-tests on the host and compiles unchanged to wasm32.
 
+pub mod auth;
 pub mod codec;
 
 #[cfg(target_arch = "wasm32")]
