@@ -22,23 +22,35 @@
 </p>
 <label>CM WebSocket URL (swap the host for a current one from GetCMListForConnect):</label>
 <input id="url" value="wss://ext1-maa2.steamserver.net:27031/cmsocket/" />
-<button id="go">Connect &amp; anon-logon</button>
+
+<p><button id="go">M2 · Connect &amp; anon-logon</button></p>
+
+<label>Steam account name (M3.1 — RSA key fetch, no password needed):</label>
+<input id="account" placeholder="your steam login name" />
+<p><button id="rsa">M3.1 · Fetch RSA public key</button></p>
+
 <div id="log">loading wasm…</div>
 
 <script type="module">
-  import init, { anon_logon } from "../pkg/wasm_steam_client.js";
+  import init, { anon_logon, get_rsa_key } from "../pkg/wasm_steam_client.js";
 
   const logEl = document.getElementById("log");
   const line = (m) => { logEl.textContent += "\n" + m; };
+  const url = () => document.getElementById("url").value.trim();
 
   await init();
   logEl.textContent = "wasm ready.";
 
   document.getElementById("go").onclick = () => {
-    const url = document.getElementById("url").value.trim();
-    logEl.textContent = "starting…";
-    try { anon_logon(url, line); }
-    catch (e) { line("error: " + e); }
+    logEl.textContent = "starting anon-logon…";
+    try { anon_logon(url(), line); } catch (e) { line("error: " + e); }
+  };
+
+  document.getElementById("rsa").onclick = () => {
+    const account = document.getElementById("account").value.trim();
+    if (!account) { logEl.textContent = "enter your Steam account name first."; return; }
+    logEl.textContent = "starting RSA key fetch…";
+    try { get_rsa_key(url(), account, line); } catch (e) { line("error: " + e); }
   };
 </script>
 </body>

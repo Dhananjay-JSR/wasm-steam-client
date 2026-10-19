@@ -106,6 +106,29 @@ pub fn unwrap_multi(multi_body: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
     Ok(frames)
 }
 
+/// Decode a received WebSocket frame into its leaf messages, expanding any Multi
+/// envelope (recursively). Frames that don't decode as protobuf (e.g. low-level
+/// control frames) are dropped. This is the receive-side entry point.
+pub fn flatten(data: &[u8]) -> Vec<Frame> {
+    let mut out = Vec::new();
+    collect(data, &mut out);
+    out
+}
+
+fn collect(data: &[u8], out: &mut Vec<Frame>) {
+    match decode(data) {
+        Ok(f) if f.emsg == EMSG_MULTI => {
+            if let Ok(inner) = unwrap_multi(&f.body) {
+                for frame in inner {
+                    collect(&frame, out);
+                }
+            }
+        }
+        Ok(f) => out.push(f),
+        Err(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +179,24 @@ mod tests {
         assert_eq!(inner.len(), 2);
         assert_eq!(decode(&inner[0]).unwrap().emsg, 751);
         assert_eq!(decode(&inner[1]).unwrap().body, vec![7]);
+    }
+
+    #[test]
+    fn flatten_expands_multi_into_leaf_frames() {
+        let f1 = encode(147, &CMsgProtoBufHeader::new(), &[1]).unwrap();
+        let f2 = encode(751, &CMsgProtoBufHeader::new(), &[2, 3]).unwrap();
+        let mut payload = Vec::new();
+        for f in [&f1, &f2] {
+            payload.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            payload.extend_from_slice(f);
+        }
+        let mut multi = CMsgMulti::new();
+        multi.set_message_body(payload);
+        let outer = encode(EMSG_MULTI, &CMsgProtoBufHeader::new(), &multi.write_to_bytes().unwrap())
+            .unwrap();
+
+        let leaves = flatten(&outer);
+        assert_eq!(leaves.iter().map(|f| f.emsg).collect::<Vec<_>>(), vec![147, 751]);
     }
 
     #[test]
