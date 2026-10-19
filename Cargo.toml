@@ -1,0 +1,14 @@
+[package]
+name = "wasm-steam-client"
+version = "0.1.0"
+edition = "2021"
+description = "A Steam CM protocol client that runs in the browser (WASM), for minting a Web API auth ticket for your own account"
+repository = "https://github.com/Dhananjay-JSR/wasm-steam-client"
+
+[dependencies]
+protobuf = "3.5"
+steam-vent-proto-steam = "0.5"
+steam-vent-proto-common = "0.5"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
