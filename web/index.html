@@ -33,10 +33,14 @@
 <input id="password" type="password" placeholder="your steam password" />
 <p><button id="begin">M3.2 · Begin login (RSA-encrypt + auth session)</button></p>
 
+<p><button id="qr">M3 · Log in with QR (no password)</button></p>
+<div id="qrbox" style="margin:12px 0;"></div>
+
 <div id="log">loading wasm…</div>
 
 <script type="module">
-  import init, { anon_logon, get_rsa_key, begin_login } from "../pkg/wasm_steam_client.js";
+  import init, { anon_logon, get_rsa_key, begin_login, begin_qr, poll_qr }
+    from "../pkg/wasm_steam_client.js";
 
   const logEl = document.getElementById("log");
   const line = (m) => { logEl.textContent += "\n" + m; };
@@ -63,6 +67,21 @@
     if (!account || !password) { logEl.textContent = "enter account name and password first."; return; }
     logEl.textContent = "starting login…";
     try { begin_login(url(), account, password, line); } catch (e) { line("error: " + e); }
+  };
+
+  let qrTimer = null;
+  const showQr = (svg) => { document.getElementById("qrbox").innerHTML = svg; };
+  document.getElementById("qr").onclick = () => {
+    logEl.textContent = "starting QR login…";
+    document.getElementById("qrbox").innerHTML = "";
+    if (qrTimer) clearInterval(qrTimer);
+    try {
+      begin_qr(url(), (m) => {
+        line(m);
+        if (m.includes("✅ approved") || m.includes("expired")) { clearInterval(qrTimer); qrTimer = null; }
+      }, showQr);
+      qrTimer = setInterval(poll_qr, 2500);  // poll until approved
+    } catch (e) { line("error: " + e); }
   };
 </script>
 </body>

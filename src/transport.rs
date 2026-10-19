@@ -16,12 +16,16 @@ use steam_vent_proto_steam::enums_clientserver::EMsg;
 use steam_vent_proto_steam::steammessages_base::CMsgProtoBufHeader;
 use crate::auth::encrypt_password;
 use protobuf::MessageField;
+use std::cell::RefCell;
 use steam_vent_proto_steam::enums::ESessionPersistence;
 use steam_vent_proto_steam::steammessages_auth_steamclient::{
     CAuthentication_BeginAuthSessionViaCredentials_Request,
-    CAuthentication_BeginAuthSessionViaCredentials_Response, CAuthentication_DeviceDetails,
-    CAuthentication_GetPasswordRSAPublicKey_Request,
-    CAuthentication_GetPasswordRSAPublicKey_Response, EAuthTokenPlatformType,
+    CAuthentication_BeginAuthSessionViaCredentials_Response,
+    CAuthentication_BeginAuthSessionViaQR_Request, CAuthentication_BeginAuthSessionViaQR_Response,
+    CAuthentication_DeviceDetails, CAuthentication_GetPasswordRSAPublicKey_Request,
+    CAuthentication_GetPasswordRSAPublicKey_Response,
+    CAuthentication_PollAuthSessionStatus_Request, CAuthentication_PollAuthSessionStatus_Response,
+    EAuthTokenPlatformType,
 };
 use steam_vent_proto_steam::steammessages_clientserver_login::{
     CMsgClientHello, CMsgClientLogon, CMsgClientLogonResponse,
@@ -124,6 +128,153 @@ fn attach_status(ws: &WebSocket, log_cb: &Function) {
     });
     ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
     onclose.forget();
+}
+
+/// The in-progress QR session, held so `poll_qr` (driven by a JS timer) can reuse the
+/// same socket and the client_id/request_id the Begin response gave us.
+struct QrSession {
+    ws: WebSocket,
+    client_id: u64,
+    request_id: Vec<u8>,
+}
+thread_local! {
+    static QR: RefCell<Option<QrSession>> = const { RefCell::new(None) };
+}
+
+/// Render a challenge URL as an inline SVG QR code.
+fn render_qr(data: &str) -> Result<String, String> {
+    let code = qrcode::QrCode::new(data.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(240, 240)
+        .build())
+}
+
+/// M3 (QR) — log in by QR, no password. Fetches a QR challenge, renders it via `qr_cb`,
+/// and stores the session so `poll_qr` can poll for approval. Scan it with the Steam
+/// mobile app; `poll_qr` then returns your refresh token.
+#[wasm_bindgen]
+pub fn begin_qr(url: &str, log_cb: Function, qr_cb: Function) -> Result<(), JsValue> {
+    let ws = WebSocket::new(url)?;
+    ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+    log(&log_cb, &format!("connecting to {url} …"));
+    QR.with(|q| {
+        *q.borrow_mut() = Some(QrSession { ws: ws.clone(), client_id: 0, request_id: Vec::new() })
+    });
+
+    let ws_open = ws.clone();
+    let cb = log_cb.clone();
+    let onopen = Closure::<dyn FnMut()>::new(move || {
+        send_hello(&ws_open);
+        let mut details = CAuthentication_DeviceDetails::new();
+        details.set_device_friendly_name("wasm-steam-client".to_string());
+        details.set_platform_type(EAuthTokenPlatformType::k_EAuthTokenPlatformType_SteamClient);
+        let mut req = CAuthentication_BeginAuthSessionViaQR_Request::new();
+        req.set_website_id("Client".to_string());
+        req.device_details = MessageField::some(details);
+        service_call(
+            &ws_open,
+            "Authentication.BeginAuthSessionViaQR#1",
+            1,
+            &req.write_to_bytes().unwrap_or_default(),
+        );
+        log(&cb, "requesting QR challenge …");
+    });
+    ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+    onopen.forget();
+
+    let cb = log_cb.clone();
+    let qcb = qr_cb.clone();
+    let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+        let data = js_sys::Uint8Array::new(&e.data()).to_vec();
+        for f in codec::flatten(&data) {
+            if f.emsg != EMsg::k_EMsgServiceMethodResponse.value() as u32 {
+                continue;
+            }
+            let eresult = f.header.eresult.unwrap_or(1);
+            match f.header.jobid_target() {
+                1 => {
+                    if eresult != 1 {
+                        log(&cb, &format!("❌ begin QR eresult={eresult}"));
+                        continue;
+                    }
+                    let Ok(r) = CAuthentication_BeginAuthSessionViaQR_Response::parse_from_bytes(&f.body) else { continue };
+                    QR.with(|q| {
+                        if let Some(s) = q.borrow_mut().as_mut() {
+                            s.client_id = r.client_id();
+                            s.request_id = r.request_id().to_vec();
+                        }
+                    });
+                    match render_qr(r.challenge_url()) {
+                        Ok(svg) => {
+                            let _ = qcb.call1(&JsValue::NULL, &JsValue::from_str(&svg));
+                            log(&cb, "scan the QR with your Steam mobile app, then approve …");
+                        }
+                        Err(e) => log(&cb, &format!("qr render error: {e}")),
+                    }
+                }
+                2 => {
+                    if eresult != 1 {
+                        log(&cb, &format!("❌ poll eresult={eresult} ({}) — QR likely expired, restart", f.header.error_message()));
+                        QR.with(|q| *q.borrow_mut() = None);
+                        continue;
+                    }
+                    let Ok(r) = CAuthentication_PollAuthSessionStatus_Response::parse_from_bytes(&f.body) else { continue };
+                    if !r.refresh_token().is_empty() {
+                        let t = r.refresh_token();
+                        log(&cb, &format!(
+                            "✅ approved — logged in as {}! refresh_token: {}… ({} chars)",
+                            r.account_name(), &t[..t.len().min(24)], t.len()
+                        ));
+                        QR.with(|q| *q.borrow_mut() = None);
+                    } else {
+                        if r.had_remote_interaction() {
+                            log(&cb, "scanned — waiting for you to approve in the app …");
+                        }
+                        QR.with(|q| {
+                            if let Some(s) = q.borrow_mut().as_mut() {
+                                if r.new_client_id() != 0 {
+                                    s.client_id = r.new_client_id();
+                                }
+                            }
+                        });
+                        if !r.new_challenge_url().is_empty() {
+                            if let Ok(svg) = render_qr(r.new_challenge_url()) {
+                                let _ = qcb.call1(&JsValue::NULL, &JsValue::from_str(&svg));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+    onmessage.forget();
+
+    attach_status(&ws, &log_cb);
+    Ok(())
+}
+
+/// Poll the QR auth session once (JS calls this on an interval until approval).
+#[wasm_bindgen]
+pub fn poll_qr() {
+    QR.with(|q| {
+        if let Some(s) = q.borrow().as_ref() {
+            if s.request_id.is_empty() {
+                return; // challenge not received yet
+            }
+            let mut req = CAuthentication_PollAuthSessionStatus_Request::new();
+            req.set_client_id(s.client_id);
+            req.set_request_id(s.request_id.clone());
+            service_call(
+                &s.ws,
+                "Authentication.PollAuthSessionStatus#1",
+                2,
+                &req.write_to_bytes().unwrap_or_default(),
+            );
+        }
+    });
 }
 
 /// Send a NonAuthed ServiceMethod call (realm=1, steamid=0, as the CM requires).
