@@ -30,6 +30,33 @@ fn log(cb: &Function, msg: &str) {
     let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(msg));
 }
 
+/// Decode one CM frame and report it. A Multi (EMsg 1) is unwrapped and its inner
+/// frames handled too (one level — nested Multi is rare; shortcut: upgrade if seen).
+fn handle_frame(cb: &Function, data: &[u8]) {
+    match codec::decode(data) {
+        Ok(f) if f.emsg == codec::EMSG_MULTI => match codec::unwrap_multi(&f.body) {
+            Ok(inner) => {
+                log(cb, &format!("Multi envelope: {} inner message(s)", inner.len()));
+                for frame in inner {
+                    handle_frame(cb, &frame);
+                }
+            }
+            Err(err) => log(cb, &format!("multi unwrap error: {err:?}")),
+        },
+        Ok(f) if f.emsg == EMsg::k_EMsgClientLogOnResponse.value() as u32 => {
+            match CMsgClientLogonResponse::parse_from_bytes(&f.body) {
+                Ok(r) => log(cb, &format!(
+                    "✅ ClientLogOnResponse eresult={} (1=OK) — transport+framing confirmed",
+                    r.eresult()
+                )),
+                Err(err) => log(cb, &format!("logon response parse error: {err:?}")),
+            }
+        }
+        Ok(f) => log(cb, &format!("recv EMsg={} ({} body bytes)", f.emsg, f.body.len())),
+        Err(err) => log(cb, &format!("decode error: {err:?} ({} bytes)", data.len())),
+    }
+}
+
 /// Open `url` (e.g. `wss://ext1-maa2.steamserver.net:27031/cmsocket/`), send an
 /// anonymous ClientLogon, and report progress through `log_cb(msg: string)`.
 #[wasm_bindgen]
@@ -63,22 +90,7 @@ pub fn anon_logon(url: &str, log_cb: Function) -> Result<(), JsValue> {
     let cb = log_cb.clone();
     let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
         let data = js_sys::Uint8Array::new(&e.data()).to_vec();
-        match codec::decode(&data) {
-            Ok(f) => {
-                if f.emsg == EMsg::k_EMsgClientLogOnResponse.value() as u32 {
-                    match CMsgClientLogonResponse::parse_from_bytes(&f.body) {
-                        Ok(r) => log(&cb, &format!(
-                            "✅ ClientLogOnResponse eresult={} (1=OK) — transport+framing confirmed",
-                            r.eresult()
-                        )),
-                        Err(err) => log(&cb, &format!("logon response parse error: {err:?}")),
-                    }
-                } else {
-                    log(&cb, &format!("recv EMsg={} ({} body bytes)", f.emsg, f.body.len()));
-                }
-            }
-            Err(err) => log(&cb, &format!("decode error: {err:?} ({} bytes)", data.len())),
-        }
+        handle_frame(&cb, &data);
     });
     ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
     onmessage.forget();

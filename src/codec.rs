@@ -12,7 +12,10 @@
 //! the message-specific protobuf.
 
 use protobuf::Message;
-use steam_vent_proto_steam::steammessages_base::CMsgProtoBufHeader;
+use steam_vent_proto_steam::steammessages_base::{CMsgMulti, CMsgProtoBufHeader};
+
+/// EMsg of a Multi envelope: Steam bundles one or more replies inside it.
+pub const EMSG_MULTI: u32 = 1;
 
 /// High bit of the EMsg word marking a protobuf (vs. legacy struct) message.
 pub const PROTO_MASK: u32 = 0x8000_0000;
@@ -25,6 +28,8 @@ pub enum CodecError {
     NotProtobuf,
     /// The header bytes didn't parse as a CMsgProtoBufHeader.
     BadHeader(protobuf::Error),
+    /// A Multi body (or its gzip payload) was malformed.
+    BadMulti,
 }
 
 /// A decoded CM message: its `EMsg` (low 31 bits), the proto header, and the raw body.
@@ -68,6 +73,39 @@ pub fn decode(data: &[u8]) -> Result<Frame, CodecError> {
     Ok(Frame { emsg, header, body })
 }
 
+/// Unwrap a Multi (EMsg 1) body into the inner message frames it carries. Each inner
+/// frame is a full CM frame (feed it back to [`decode`]). The payload is gunzipped first
+/// when `size_unzipped` is set.
+pub fn unwrap_multi(multi_body: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
+    use std::io::Read;
+    let multi = CMsgMulti::parse_from_bytes(multi_body).map_err(CodecError::BadHeader)?;
+    let payload = if multi.size_unzipped() > 0 {
+        let mut out = Vec::with_capacity(multi.size_unzipped() as usize);
+        flate2::read::GzDecoder::new(multi.message_body())
+            .read_to_end(&mut out)
+            .map_err(|_| CodecError::BadMulti)?;
+        out
+    } else {
+        multi.message_body().to_vec()
+    };
+
+    // payload is a run of [u32 LE len][len bytes] records.
+    let mut frames = Vec::new();
+    let mut i = 0usize;
+    while i + 4 <= payload.len() {
+        let len =
+            u32::from_le_bytes([payload[i], payload[i + 1], payload[i + 2], payload[i + 3]]) as usize;
+        i += 4;
+        let end = i.checked_add(len).ok_or(CodecError::BadMulti)?;
+        if end > payload.len() {
+            return Err(CodecError::BadMulti);
+        }
+        frames.push(payload[i..end].to_vec());
+        i = end;
+    }
+    Ok(frames)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +135,27 @@ mod tests {
         assert_eq!(f.header.client_sessionid(), 42);
         assert_eq!(f.header.jobid_source(), 7);
         assert_eq!(f.body, body);
+    }
+
+    #[test]
+    fn unwrap_multi_splits_inner_frames() {
+        // build an uncompressed Multi carrying two inner frames
+        let f1 = encode(751, &CMsgProtoBufHeader::new(), &[9, 9]).unwrap();
+        let f2 = encode(5514, &CMsgProtoBufHeader::new(), &[7]).unwrap();
+        let mut payload = Vec::new();
+        for f in [&f1, &f2] {
+            payload.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            payload.extend_from_slice(f);
+        }
+        let mut multi = CMsgMulti::new();
+        multi.set_size_unzipped(0); // 0 == not gzipped
+        multi.set_message_body(payload);
+        let multi_body = multi.write_to_bytes().unwrap();
+
+        let inner = unwrap_multi(&multi_body).unwrap();
+        assert_eq!(inner.len(), 2);
+        assert_eq!(decode(&inner[0]).unwrap().emsg, 751);
+        assert_eq!(decode(&inner[1]).unwrap().body, vec![7]);
     }
 
     #[test]

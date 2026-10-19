@@ -9,6 +9,7 @@ repository = "https://github.com/Dhananjay-JSR/wasm-steam-client"
 protobuf = "3.5"
 steam-vent-proto-steam = "0.5"
 steam-vent-proto-common = "0.5"
+flate2 = "1"           # pure-Rust (miniz_oxide) backend → wasm-safe; gunzips Multi payloads
 
 # Browser transport (only used on the wasm32 target).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
