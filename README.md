@@ -86,6 +86,53 @@ curl "https://api.steampowered.com/ISteamDirectory/GetCMListForConnect/v1/?cmtyp
 > `cargo`/`wasm-pack` resolve to Homebrew after a shell restart, prefix with
 > `export PATH="$HOME/.cargo/bin:$PATH"`.
 
+## Use it in your JS project
+
+`wasm-pack build --target web` emits an ES-module package in `pkg/`. Import it, call the default
+`init()` once, then use the exports. They stream progress as strings through a callback — wrap that in
+a Promise. Full runnable version in [`examples/usage.js`](examples/usage.js).
+
+```js
+import init, { begin_qr, poll_qr, mint_ticket, has_token } from "../pkg/wasm_steam_client.js";
+
+const CM_URL = "wss://ext1-maa2.steamserver.net:27031/cmsocket/";
+
+function qrLogin(onQr) {                       // onQr(svg) → render the QR to scan
+  return new Promise((resolve, reject) => {
+    let timer;
+    begin_qr(CM_URL, (msg) => {
+      const m = msg.match(/logged in as (\S+)!/);
+      if (m) { clearInterval(timer); resolve(m[1]); }
+      if (msg.includes("expired")) { clearInterval(timer); reject(new Error("QR expired")); }
+    }, onQr);
+    timer = setInterval(poll_qr, 2500);        // poll until approved in the mobile app
+  });
+}
+
+function mintTicket(appId) {                    // resolves with the hex ticket
+  return new Promise((resolve, reject) => {
+    let hexNext = false;
+    mint_ticket(CM_URL, appId, (msg) => {
+      if (hexNext) return resolve(msg.trim());
+      if (msg.includes("(hex):")) hexNext = true;
+      if (msg.startsWith("❌")) reject(new Error(msg));
+    });
+  });
+}
+
+await init();
+const account = await qrLogin((svg) => (qrBox.innerHTML = svg));
+const ticket  = await mintTicket(1808500);     // an appid you own
+```
+
+Exports: `init` (default), `anon_logon`, `get_rsa_key`, `begin_login`, `begin_qr`, `poll_qr`,
+`mint_ticket`, `has_token`. With a bundler (Vite/webpack), use `wasm-pack build --target bundler`
+and `import` the package instead of the raw `.js`.
+
+> **CORS caveat:** the CM server list (`ISteamDirectory/GetCMListForConnect`) is CORS-blocked from a
+> browser, so hardcode a `wss://<host>/cmsocket/` endpoint (refresh it occasionally) or proxy that one
+> HTTP request through your backend. The WebSocket connection itself is not subject to CORS.
+
 ## Security notes
 
 - Your **password is RSA-encrypted inside the WASM module** before anything is sent; the cleartext
