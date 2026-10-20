@@ -2,7 +2,7 @@
 name = "wasm-steam-client"
 version = "0.1.0"
 edition = "2021"
-description = "A Steam CM protocol client that runs in the browser (WASM), for minting a Web API auth ticket for your own account"
+description = "A Steam CM-protocol client that runs entirely in the browser (Rust/WASM): QR or password login and Web API auth-ticket minting for your own account, with no local Steam install"
 repository = "https://github.com/Dhananjay-JSR/wasm-steam-client"
 
 [dependencies]
