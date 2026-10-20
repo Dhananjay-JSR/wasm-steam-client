@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Test (host)
+        run: cargo test
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build (wasm)
+        run: wasm-pack build --target web
+
+      - name: Package
+        run: tar -czf wasm-steam-client-${{ github.ref_name }}.tar.gz pkg web examples README.md LICENSE
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wasm-steam-client-*.tar.gz
+          generate_release_notes: true

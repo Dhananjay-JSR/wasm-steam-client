@@ -1,5 +1,7 @@
 # wasm-steam-client
 
+[![CI](https://github.com/Dhananjay-JSR/wasm-steam-client/actions/workflows/ci.yml/badge.svg)](https://github.com/Dhananjay-JSR/wasm-steam-client/actions/workflows/ci.yml)
+
 A **Steam client that runs entirely in a browser tab**, written in Rust and compiled to WASM.
 It speaks the real Steam **Connection Manager (CM) protocol** over a `wss://` WebSocket — the same
 wire protocol the desktop client uses — so it can **log in** (QR or password) and **mint a Web API
