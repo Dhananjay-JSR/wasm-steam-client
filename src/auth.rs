@@ -33,6 +33,34 @@ pub fn encrypt_password(modulus: &str, exponent: &str, password: &str) -> Result
     Ok(BASE64_STANDARD.encode(ct))
 }
 
+/// Assemble a Steam auth session ticket. Returns `(full_ticket, auth_ticket)`:
+/// `full_ticket` is hex-encoded for `AuthenticateUserTicket`; `auth_ticket` (GC token +
+/// 24-byte session header) is the part the `ClientAuthList` CRC covers and the part sent
+/// as the ticket in that message. Layout is little-endian, per node-steam-user.
+pub fn build_auth_ticket(
+    gc_token: &[u8],
+    public_ip: u32,
+    timestamp_ms: u32,
+    connection_count: u32,
+    ownership_ticket: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    let mut auth = Vec::with_capacity(4 + gc_token.len() + 4 + 24);
+    auth.extend_from_slice(&(gc_token.len() as u32).to_le_bytes());
+    auth.extend_from_slice(gc_token);
+    auth.extend_from_slice(&24u32.to_le_bytes()); // session header length
+    auth.extend_from_slice(&1u32.to_le_bytes()); // unknown
+    auth.extend_from_slice(&2u32.to_le_bytes()); // unknown
+    auth.extend_from_slice(&public_ip.to_le_bytes());
+    auth.extend_from_slice(&0u32.to_le_bytes()); // filler
+    auth.extend_from_slice(&timestamp_ms.to_le_bytes());
+    auth.extend_from_slice(&connection_count.to_le_bytes());
+
+    let mut full = auth.clone();
+    full.extend_from_slice(&(ownership_ticket.len() as u32).to_le_bytes());
+    full.extend_from_slice(ownership_ticket);
+    (full, auth)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +85,19 @@ mod tests {
     #[test]
     fn rejects_bad_hex() {
         assert!(encrypt_password("zz", "010001", "x").is_err());
+    }
+
+    #[test]
+    fn build_auth_ticket_has_expected_layout() {
+        let gc = vec![0xAAu8; 20];
+        let own = vec![0xBBu8; 184];
+        let (full, auth) = build_auth_ticket(&gc, 0x01020304, 1234, 1, &own);
+        // auth part = 4 + gc.len() + 4 + 24
+        assert_eq!(auth.len(), 4 + 20 + 4 + 24);
+        // full = auth + 4 (ownership len) + ownership
+        assert_eq!(full.len(), auth.len() + 4 + 184);
+        assert_eq!(u32::from_le_bytes(auth[0..4].try_into().unwrap()), 20); // gc len prefix
+        assert_eq!(&full[..auth.len()], &auth[..]); // auth is a prefix of full
     }
 
     #[test]

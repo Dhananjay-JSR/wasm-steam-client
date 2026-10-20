@@ -14,13 +14,13 @@ use js_sys::Function;
 use protobuf::{Enum, Message};
 use steam_vent_proto_steam::enums_clientserver::EMsg;
 use steam_vent_proto_steam::steammessages_base::CMsgProtoBufHeader;
-use crate::auth::{encrypt_password, steamid_from_jwt};
+use crate::auth::{build_auth_ticket, encrypt_password, steamid_from_jwt};
 use protobuf::MessageField;
 use std::cell::RefCell;
-use steam_vent_proto_steam::steammessages_base::CMsgIPAddress;
+use steam_vent_proto_steam::steammessages_base::{CMsgAuthTicket, CMsgIPAddress};
 use steam_vent_proto_steam::steammessages_clientserver::{
-    CMsgClientGameConnectTokens, CMsgClientGetAppOwnershipTicket,
-    CMsgClientGetAppOwnershipTicketResponse,
+    CMsgClientAuthList, CMsgClientGameConnectTokens, CMsgClientGetAppOwnershipTicket,
+    CMsgClientGetAppOwnershipTicketResponse, CMsgClientTicketAuthComplete,
 };
 use steam_vent_proto_steam::enums::ESessionPersistence;
 use steam_vent_proto_steam::steammessages_auth_steamclient::{
@@ -300,8 +300,10 @@ struct Session {
     session_id: i32,
     public_ip: u32,
     app_id: u32,
+    connect_time: f64,
     gc_tokens: Vec<Vec<u8>>,
     ownership_ticket: Vec<u8>,
+    built: bool,
 }
 thread_local! {
     static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
@@ -348,8 +350,10 @@ pub fn mint_ticket(url: &str, app_id: u32, log_cb: Function) -> Result<(), JsVal
             session_id: 0,
             public_ip: 0,
             app_id,
+            connect_time: js_sys::Date::now(),
             gc_tokens: Vec::new(),
             ownership_ticket: Vec::new(),
+            built: false,
         })
     });
 
@@ -427,6 +431,14 @@ pub fn mint_ticket(url: &str, app_id: u32, log_cb: Function) -> Result<(), JsVal
                 });
                 log(&cb, &format!("received app ownership ticket ({len} bytes) for app {}", r.app_id()));
                 report_ready(&cb);
+            } else if emsg == EMsg::k_EMsgClientTicketAuthComplete.value() as u32 {
+                let Ok(r) = CMsgClientTicketAuthComplete::parse_from_bytes(&f.body) else { continue };
+                // eauth_session_response: 0 == k_EAuthSessionResponseOK
+                if r.eauth_session_response() == 0 {
+                    log(&cb, "✅ ticket validated by Steam (response=OK) — usable with AuthenticateUserTicket.");
+                } else {
+                    log(&cb, &format!("⚠️ ticket auth response={} (non-OK)", r.eauth_session_response()));
+                }
             }
         }
     });
@@ -437,15 +449,74 @@ pub fn mint_ticket(url: &str, app_id: u32, log_cb: Function) -> Result<(), JsVal
     Ok(())
 }
 
-/// Log when both ticket ingredients are in hand.
+/// When both ticket ingredients are in hand, build + activate the ticket (once).
 fn report_ready(cb: &Function) {
-    SESSION.with(|s| {
-        if let Some(s) = s.borrow().as_ref() {
-            if !s.gc_tokens.is_empty() && !s.ownership_ticket.is_empty() {
-                log(cb, "🧩 have GC token + ownership ticket — ready to build the Web API ticket (M4 part B).");
+    // Decide and flip `built` under a short borrow, then act without holding it.
+    let go = SESSION.with(|s| {
+        let mut b = s.borrow_mut();
+        match b.as_mut() {
+            Some(s) if !s.built && !s.gc_tokens.is_empty() && !s.ownership_ticket.is_empty() => {
+                s.built = true;
+                true
             }
+            _ => false,
         }
     });
+    if go {
+        build_and_activate(cb);
+    }
+}
+
+/// Assemble the Web API auth ticket, send ClientAuthList to activate it, and print
+/// the final hex ticket.
+fn build_and_activate(cb: &Function) {
+    let (ws, steamid, session_id, app_id, gc_token, ownership, public_ip, timestamp, tokens_left) =
+        SESSION.with(|s| {
+            let b = s.borrow();
+            let s = b.as_ref().unwrap();
+            let elapsed = (js_sys::Date::now() - s.connect_time) as u32;
+            (
+                s.ws.clone(),
+                s.steamid,
+                s.session_id,
+                s.app_id,
+                s.gc_tokens[0].clone(),
+                s.ownership_ticket.clone(),
+                s.public_ip,
+                elapsed,
+                s.gc_tokens.len() as u32 - 1,
+            )
+        });
+
+    let (full, auth) = build_auth_ticket(&gc_token, public_ip, timestamp, 1, &ownership);
+    let crc = crc32fast::hash(&auth);
+
+    let mut ticket = CMsgAuthTicket::new();
+    ticket.set_estate(0);
+    ticket.set_steamid(0); // 0 for your own ticket
+    ticket.set_gameid(app_id as u64);
+    ticket.set_h_steam_pipe((rand::random::<u32>() % 1_000_000) + 1);
+    ticket.set_ticket_crc(crc);
+    ticket.set_ticket(auth);
+
+    let mut list = CMsgClientAuthList::new();
+    list.set_tokens_left(tokens_left);
+    list.set_last_request_seq(0);
+    list.set_last_request_seq_from_server(0);
+    list.tickets.push(ticket);
+    list.app_ids.push(app_id);
+    list.set_message_sequence(1);
+
+    client_send(
+        &ws,
+        EMsg::k_EMsgClientAuthList.value() as u32,
+        steamid,
+        session_id,
+        &list.write_to_bytes().unwrap_or_default(),
+    );
+    log(cb, &format!("activating ticket (crc={crc}) …"));
+    log(cb, &format!("🎟️ Web API auth ticket for app {app_id} (hex):"));
+    log(cb, &hex::encode(&full));
 }
 
 /// Send a NonAuthed ServiceMethod call (realm=1, steamid=0, as the CM requires).
